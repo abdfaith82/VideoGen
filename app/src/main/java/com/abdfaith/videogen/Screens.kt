@@ -54,6 +54,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -416,6 +418,11 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     var negative by remember { mutableStateOf(initial.negativePrompt) }
     var chain by remember { mutableStateOf(initial.chainFrames) }
     var saved by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val inspector = remember { SpaceInspector() }
+    var testing by remember { mutableStateOf(false) }
+    var testMsg by remember { mutableStateOf("") }
+    var endpoints by remember { mutableStateOf(emptyList<EndpointInfo>()) }
 
     Scaffold(
         topBar = {
@@ -441,6 +448,56 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                 label = { Text("رابط الـ Space (…hf.space)") },
                 textStyle = LtrStyle, singleLine = true, modifier = Modifier.fillMaxWidth()
             )
+            OutlinedButton(
+                enabled = !testing,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    testing = true
+                    testMsg = ""
+                    endpoints = emptyList()
+                    scope.launch {
+                        try {
+                            url = SpaceInspector.normalizeUrl(url)
+                            val found = inspector.inspect(url, token)
+                            endpoints = found
+                            testMsg = if (found.isEmpty()) {
+                                "الاتصال ناجح، لكن لا توجد دوال مسمّاة في هذا الـ Space"
+                            } else {
+                                "الاتصال ناجح ✓ اختر الدالة المناسبة (★ = تُرجع فيديو):"
+                            }
+                        } catch (e: Exception) {
+                            testMsg = e.message ?: "فشل الاختبار"
+                        } finally {
+                            testing = false
+                        }
+                    }
+                }
+            ) { Text(if (testing) "جارٍ الاختبار…" else "اختبار الاتصال") }
+            if (testMsg.isNotEmpty()) {
+                Text(testMsg, style = MaterialTheme.typography.bodyMedium)
+            }
+            endpoints.forEach { ep ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            (if (ep.returnsVideo) "★ " else "") + "/" + ep.apiName,
+                            style = MaterialTheme.typography.titleSmall.merge(LtrStyle)
+                        )
+                        ep.params.forEachIndexed { i, pr ->
+                            Text(
+                                "${i + 1}. ${pr.label.ifBlank { pr.name }} (${pr.component})",
+                                style = MaterialTheme.typography.bodySmall.merge(LtrStyle)
+                            )
+                        }
+                        Button(onClick = {
+                            api = ep.apiName
+                            template = SpaceInspector.buildTemplate(ep)
+                            saved = false
+                            testMsg = "تم ملء الدالة والقالب. راجع القالب ثم اضغط حفظ."
+                        }) { Text("استخدم هذه الدالة") }
+                    }
+                }
+            }
             OutlinedTextField(
                 value = api, onValueChange = { api = it; saved = false },
                 label = { Text("api_name (مثل generate)") },
@@ -474,7 +531,7 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
             Button(
                 onClick = {
                     vm.settings.save(
-                        ProviderConfig(url, api, template, token, negative, chain)
+                        ProviderConfig(SpaceInspector.normalizeUrl(url), api, template, token, negative, chain)
                     )
                     saved = true
                 },
