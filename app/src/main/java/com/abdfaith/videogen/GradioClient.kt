@@ -94,7 +94,20 @@ class GradioClient {
                     line.startsWith("data:") -> {
                         val payload = line.removePrefix("data:").trim()
                         if (event == "complete") return@withContext JSONArray(payload)
-                        if (event == "error") throw IOException("خطأ من الخدمة: ${payload.take(300)}")
+                        if (event == "error") {
+                            val detail = payload.trim().trim('"')
+                            throw IOException(
+                                if (detail.isEmpty() || detail == "null") {
+                                    "الخدمة رفضت الطلب دون تفاصيل. الأسباب الشائعة: " +
+                                        "(1) نفاد حصة GPU المجانية: أضف توكن Hugging Face في الإعدادات وأعد المحاولة لاحقاً، " +
+                                        "(2) قالب المدخلات لا يطابق الدالة: أعد ملأه بزر «اختبار الاتصال»، " +
+                                        "(3) الـ Space يتطلب صورة بداية، " +
+                                        "(4) خطأ داخلي في الـ Space: جرّب Space آخر."
+                                } else {
+                                    "خطأ من الخدمة: ${detail.take(300)}"
+                                }
+                            )
+                        }
                     }
                 }
             }
