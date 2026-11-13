@@ -25,10 +25,10 @@ data class EndpointInfo(
 )
 
 /** يقرأ وصف واجهة Gradio (/info) ليملأ api_name وقالب data تلقائياً. */
-class SpaceInspector {
+class SpaceInspector(connectSec: Long = 20, readSec: Long = 40) {
     private val http = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(40, TimeUnit.SECONDS)
+        .connectTimeout(connectSec, TimeUnit.SECONDS)
+        .readTimeout(readSec, TimeUnit.SECONDS)
         .build()
 
     suspend fun inspect(rawUrl: String, token: String): List<EndpointInfo> =

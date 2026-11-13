@@ -423,6 +423,11 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     var testing by remember { mutableStateOf(false) }
     var testMsg by remember { mutableStateOf("") }
     var endpoints by remember { mutableStateOf(emptyList<EndpointInfo>()) }
+    val searcher = remember { SpaceSearch() }
+    var query by remember { mutableStateOf("image to video") }
+    var searching by remember { mutableStateOf(false) }
+    var searchMsg by remember { mutableStateOf("") }
+    var found by remember { mutableStateOf(emptyList<SpaceCandidate>()) }
 
     Scaffold(
         topBar = {
@@ -443,6 +448,65 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                     "وانسخ اسم الدالة وترتيب المدخلات. الخدمات المجانية تخضع لحصص وقد تتغير أو تتوقف.",
                 style = MaterialTheme.typography.bodySmall
             )
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("البحث عن Space جاهز", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "يبحث في Hugging Face ثم يفحص كل نتيجة فعلياً، ويعرض فقط ما يعمل الآن ولديه دالة تُرجع فيديو وتقبل نصاً.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = query, onValueChange = { query = it },
+                        label = { Text("كلمات البحث (إنجليزي)") },
+                        textStyle = LtrStyle, singleLine = true, modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        enabled = !searching && query.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            searching = true
+                            found = emptyList()
+                            searchMsg = "جارٍ البحث…"
+                            scope.launch {
+                                try {
+                                    val res = searcher.search(query, token) { searchMsg = it }
+                                    found = res
+                                    searchMsg = if (res.isEmpty()) {
+                                        "لا يوجد Space صالح الآن. غيّر كلمات البحث (مثل: ltx video, wan, text to video) وأعد المحاولة."
+                                    } else {
+                                        "وجدت ${res.size} Space صالحاً، الأفضل أولاً:"
+                                    }
+                                } catch (e: Exception) {
+                                    searchMsg = e.message ?: "فشل البحث"
+                                } finally {
+                                    searching = false
+                                }
+                            }
+                        }
+                    ) { Text(if (searching) "جارٍ الفحص…" else "ابحث وفلتر الأفضل") }
+                    if (searchMsg.isNotEmpty()) Text(searchMsg, style = MaterialTheme.typography.bodyMedium)
+                    found.forEach { c ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(c.id, style = MaterialTheme.typography.titleSmall.merge(LtrStyle))
+                                Text(
+                                    "♥ ${c.likes} · /${c.ep.apiName} · ${c.ep.params.size} مدخلات" +
+                                        if (c.acceptsImage) " · يقبل صورة" else " · نص فقط",
+                                    style = MaterialTheme.typography.bodySmall.merge(LtrStyle)
+                                )
+                                Button(onClick = {
+                                    url = c.url
+                                    api = c.ep.apiName
+                                    template = SpaceInspector.buildTemplate(c.ep)
+                                    endpoints = emptyList()
+                                    saved = false
+                                    testMsg = "تم اختيار ${c.id} وملء الدالة والقالب. اضغط حفظ ثم جرّب التوليد."
+                                }) { Text("استخدم هذا الـ Space") }
+                            }
+                        }
+                    }
+                }
+            }
             OutlinedTextField(
                 value = url, onValueChange = { url = it; saved = false },
                 label = { Text("رابط الـ Space (…hf.space)") },
