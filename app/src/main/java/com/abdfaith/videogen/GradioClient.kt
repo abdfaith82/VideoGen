@@ -119,7 +119,11 @@ class GradioClient {
     suspend fun download(cfg: ProviderConfig, result: JSONArray, dest: File) =
         withContext(Dispatchers.IO) {
             val b = base(cfg.spaceUrl)
-            val url = findFileUrl(result, b) ?: throw IOException("لا يوجد ملف فيديو في النتيجة")
+            val url = findFileUrl(result, b) ?: throw IOException(
+                "لا يوجد ملف فيديو في النتيجة. رد الخدمة الخام: ${result.toString().take(400)}\n" +
+                    "إن كان الرد معرّف مهمة أو حالة فهذه دالة إرسال وليست دالة النتيجة؛ " +
+                    "اختر من «اختبار الاتصال» دالة عليها ★ (تُرجع فيديو)، أو أرسل لي هذا الرد."
+            )
             val builder = Request.Builder().url(url)
             if (url.startsWith(b)) builder.auth(cfg.hfToken)
             http.newCall(builder.get().build()).execute().use { r ->
@@ -130,8 +134,21 @@ class GradioClient {
             if (dest.length() == 0L) throw IOException("الفيديو المحمّل فارغ")
         }
 
+    private val videoExt = Regex("""\.(mp4|webm|mov|mkv)(\?.*)?$""", RegexOption.IGNORE_CASE)
+
     private fun findFileUrl(node: Any?, base: String): String? {
         when (node) {
+            is String -> {
+                val s = node.trim()
+                if (s.startsWith("http") && videoExt.containsMatchIn(s)) return s
+                if (s.startsWith("/") && videoExt.containsMatchIn(s)) return "$base/gradio_api/file=$s"
+                if (s.startsWith("{") || s.startsWith("[")) {
+                    val inner: Any? = runCatching {
+                        if (s.startsWith("{")) JSONObject(s) else JSONArray(s)
+                    }.getOrNull()
+                    if (inner != null) return findFileUrl(inner, base)
+                }
+            }
             is JSONArray -> for (i in 0 until node.length()) {
                 findFileUrl(node.opt(i), base)?.let { return it }
             }
