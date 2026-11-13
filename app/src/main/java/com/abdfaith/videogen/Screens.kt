@@ -35,6 +35,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -204,6 +205,7 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     val project by vm.current.collectAsState()
     val busy by vm.busy.collectAsState()
     val status by vm.status.collectAsState()
+    val aiIndex by vm.aiIndex.collectAsState()
     val p = project
     if (p == null) {
         LaunchedEffect(Unit) { onBack() }
@@ -212,6 +214,11 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
         if (uri != null) vm.setStartImage(uri)
+    }
+    var camUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val u = camUri
+        if (ok && u != null) vm.setStartImage(u)
     }
     var showScript by remember { mutableStateOf(false) }
     var script by remember { mutableStateOf("") }
@@ -258,6 +265,18 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                                     )
                                 }
                             ) { Text(if (img == null) "اختر صورة" else "تغيير الصورة") }
+                            OutlinedButton(
+                                enabled = !busy,
+                                onClick = {
+                                    try {
+                                        val u = vm.newCameraUri()
+                                        camUri = u
+                                        camera.launch(u)
+                                    } catch (e: Exception) {
+                                        vm.status.value = "تعذّر فتح الكاميرا: لا يوجد تطبيق كاميرا أو خطأ في الملف"
+                                    }
+                                }
+                            ) { Text("التقاط بالكاميرا") }
                             if (img != null) {
                                 TextButton(enabled = !busy, onClick = { vm.clearStartImage() }) { Text("إزالة") }
                             }
@@ -307,6 +326,20 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                             IconButton(enabled = !busy, onClick = { vm.removeScene(i) }) {
                                 Icon(Icons.Default.Delete, "حذف المشهد")
                             }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                enabled = !busy && aiIndex < 0 && s.prompt.isNotBlank(),
+                                onClick = { vm.enhanceScene(i) },
+                                contentPadding = PaddingValues(horizontal = 8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) { Text(if (aiIndex == i) "جارٍ التوليد…" else "برومبت احترافي") }
+                            Button(
+                                enabled = !busy && aiIndex < 0 && s.prompt.isNotBlank(),
+                                onClick = { vm.splitAndGenerate(i, 20) },
+                                contentPadding = PaddingValues(horizontal = 8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) { Text("قسّم ×20 وولّد") }
                         }
                         val err = s.error
                         if (err != null && s.status == SceneStatus.FAILED) {
@@ -417,6 +450,7 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     var token by remember { mutableStateOf(initial.hfToken) }
     var negative by remember { mutableStateOf(initial.negativePrompt) }
     var chain by remember { mutableStateOf(initial.chainFrames) }
+    var parallel by remember { mutableStateOf(initial.parallel) }
     var saved by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val inspector = remember { SpaceInspector() }
@@ -612,10 +646,29 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                 }
                 Switch(checked = chain, onCheckedChange = { chain = it; saved = false })
             }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("عدد المشاهد المتوازية", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "يعمل فقط حين يكون «ربط المشاهد بآخر إطار» مطفأً، لأن الربط يفرض التتابع. " +
+                        "الخدمات المجانية قد ترفض أو تؤخّر الطلبات المتزامنة.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    (1..4).forEach { n ->
+                        FilterChip(
+                            selected = parallel == n,
+                            onClick = { parallel = n; saved = false },
+                            label = { Text("$n") }
+                        )
+                    }
+                }
+            }
             Button(
                 onClick = {
                     vm.settings.save(
-                        ProviderConfig(SpaceInspector.normalizeUrl(url), api, template, token, negative, chain)
+                        ProviderConfig(
+                            SpaceInspector.normalizeUrl(url), api, template, token, negative, chain, parallel
+                        )
                     )
                     saved = true
                 },

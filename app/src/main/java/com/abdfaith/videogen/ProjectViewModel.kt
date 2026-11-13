@@ -6,30 +6,44 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 
 class ProjectViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ProjectStore(app)
     val settings = SettingsStore(app)
     private val client = GradioClient()
+    private val ai = PromptAi()
 
     val projects = MutableStateFlow(store.loadAll())
     val current = MutableStateFlow<Project?>(null)
     val busy = MutableStateFlow(false)
     val status = MutableStateFlow("")
+    /** فهرس المشهد الذي يعمل عليه مساعد البرومبت الآن (-1 = لا شيء). */
+    val aiIndex = MutableStateFlow(-1)
     private var job: Job? = null
+    private val mu = Mutex()
 
     // ---------- المشاريع ----------
 
@@ -46,6 +60,22 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
             listOf(p) + list
         }
     }
+
+    /** حفظ من مهام الخلفية: لا يغيّر المشروع المفتوح إلا إن كان هو نفسه. */
+    private fun commitBg(p0: Project) {
+        val p = p0.copy(updatedAt = System.currentTimeMillis())
+        runCatching { store.save(p) }
+        if (current.value?.id == p.id) current.value = p
+        projects.value = projects.value.map { if (it.id == p.id) p else it }
+    }
+
+    private suspend fun patchScene(pid: String, sid: String, f: (Scene) -> Scene) = mu.withLock {
+        val base = projects.value.firstOrNull { it.id == pid } ?: return@withLock
+        commitBg(base.copy(scenes = base.scenes.map { if (it.id == sid) f(it) else it }))
+    }
+
+    private fun sceneOf(pid: String, sid: String): Scene? =
+        projects.value.firstOrNull { it.id == pid }?.scenes?.firstOrNull { it.id == sid }
 
     fun createProject(title: String) {
         commit(
@@ -70,6 +100,14 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- تحرير المشاهد ----------
+
+    /** ينشئ ملفاً مؤقتاً ويعيد Uri آمناً لتمريره إلى تطبيق الكاميرا. */
+    fun newCameraUri(): Uri {
+        val ctx = getApplication<Application>()
+        val dir = File(ctx.cacheDir, "camera").apply { mkdirs() }
+        val f = File.createTempFile("shot_", ".jpg", dir)
+        return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
+    }
 
     fun setStartImage(uri: Uri) {
         val p = current.value ?: return
@@ -135,15 +173,52 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
     private fun Project.mapScene(index: Int, f: (Scene) -> Scene) =
         copy(scenes = scenes.mapIndexed { i, s -> if (i == index) f(s) else s })
 
+    // ---------- مساعد البرومبت ----------
+
+    /** يحوّل وصف المشهد (بأي لغة) إلى برومبت احترافي ويضعه مكانه. */
+    fun enhanceScene(index: Int) {
+        val p = current.value ?: return
+        val sc = p.scenes.getOrNull(index) ?: return
+        if (busy.value || aiIndex.value >= 0) return
+        if (sc.prompt.isBlank()) {
+            status.value = "اكتب وصفاً للمشهد أولاً (بأي لغة)"
+            return
+        }
+        viewModelScope.launch {
+            aiIndex.value = index
+            status.value = "جارٍ توليد برومبت احترافي…"
+            try {
+                val r = ai.enhance(sc.prompt)
+                sc.videoPath?.let { File(it).delete() }
+                sc.lastFramePath?.let { File(it).delete() }
+                patchScene(p.id, sc.id) {
+                    it.copy(
+                        prompt = r.value,
+                        status = SceneStatus.PENDING,
+                        videoPath = null,
+                        lastFramePath = null,
+                        error = null
+                    )
+                }
+                status.value = if (r.fromAi) {
+                    "تم توليد البرومبت الاحترافي ✓"
+                } else {
+                    "الخدمة السحابية غير متاحة الآن: استُخدم قالب محلي. اكتب الوصف بالإنجليزية لنتيجة أفضل."
+                }
+            } finally {
+                aiIndex.value = -1
+            }
+        }
+    }
+
     // ---------- التوليد ----------
 
-    fun generate() {
-        val start = current.value ?: return
+    private fun launchJob(pid: String, block: suspend () -> Unit) {
         if (busy.value) return
         job = viewModelScope.launch {
             busy.value = true
             try {
-                runPipeline(start)
+                block()
             } catch (e: CancellationException) {
                 status.value = "تم الإيقاف"
                 throw e
@@ -152,14 +227,53 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 busy.value = false
                 // أي مشهد بقي بحالة التشغيل يعود للانتظار
-                current.value?.let { cur ->
-                    if (cur.scenes.any { it.status == SceneStatus.RUNNING }) {
-                        commit(cur.copy(scenes = cur.scenes.map {
-                            if (it.status == SceneStatus.RUNNING) it.copy(status = SceneStatus.PENDING) else it
-                        }))
-                    }
-                }
+                withContext(NonCancellable) { resetRunning(pid) }
             }
+        }
+    }
+
+    private suspend fun resetRunning(pid: String) = mu.withLock {
+        val base = projects.value.firstOrNull { it.id == pid } ?: return@withLock
+        if (base.scenes.any { it.status == SceneStatus.RUNNING }) {
+            commitBg(
+                base.copy(scenes = base.scenes.map {
+                    if (it.status == SceneStatus.RUNNING) it.copy(status = SceneStatus.PENDING) else it
+                })
+            )
+        }
+    }
+
+    fun generate() {
+        val p = current.value ?: return
+        launchJob(p.id) { runPipeline(p.id) }
+    }
+
+    /** يقسّم المشهد إلى [count] لقطات متتابعة ثم يولّدها ويجمّعها بضغطة واحدة. */
+    fun splitAndGenerate(index: Int, count: Int = 20) {
+        val p = current.value ?: return
+        val sc = p.scenes.getOrNull(index) ?: return
+        if (busy.value || aiIndex.value >= 0) return
+        if (sc.prompt.isBlank()) {
+            status.value = "اكتب وصف المشهد أولاً"
+            return
+        }
+        launchJob(p.id) {
+            status.value = "تقسيم المشهد إلى $count لقطة…"
+            val r = ai.split(sc.prompt, count)
+            sc.videoPath?.let { File(it).delete() }
+            sc.lastFramePath?.let { File(it).delete() }
+            mu.withLock {
+                val base = projects.value.firstOrNull { it.id == p.id } ?: return@withLock
+                val shots = r.value.map { newScene(it) }
+                val list = base.scenes.flatMap { if (it.id == sc.id) shots else listOf(it) }
+                commitBg(base.copy(scenes = list, outputPath = null))
+            }
+            status.value = if (r.fromAi) {
+                "تم التقسيم إلى ${r.value.size} لقطة — بدء التوليد…"
+            } else {
+                "تقسيم محلي (الخدمة السحابية غير متاحة) إلى ${r.value.size} لقطة — بدء التوليد…"
+            }
+            runPipeline(p.id)
         }
     }
 
@@ -167,66 +281,116 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
         job?.cancel()
     }
 
-    private suspend fun runPipeline(start: Project) {
+    /** يولّد مشهداً واحداً ويحفظ نتيجته. يعيد true عند النجاح. */
+    private suspend fun generateOne(
+        cfg: ProviderConfig,
+        dir: File,
+        pid: String,
+        sid: String,
+        prompt: String,
+        image: String?
+    ): Boolean {
+        patchScene(pid, sid) { it.copy(status = SceneStatus.RUNNING, error = null) }
+        return try {
+            val imageFile = image?.let { File(it) }?.takeIf { it.exists() }
+            val data = buildData(cfg, prompt, imageFile)
+            val result = client.call(cfg, data)
+            val video = File(dir, "scene_$sid.mp4")
+            client.download(cfg, result, video)
+            val frame = File(dir, "scene_${sid}_last.jpg")
+            val ok = FrameExtractor.lastFrame(video.absolutePath, frame)
+            patchScene(pid, sid) {
+                it.copy(
+                    status = SceneStatus.DONE,
+                    videoPath = video.absolutePath,
+                    lastFramePath = if (ok) frame.absolutePath else null,
+                    error = null
+                )
+            }
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            patchScene(pid, sid) { it.copy(status = SceneStatus.FAILED, error = e.message ?: "فشل غير معروف") }
+            false
+        }
+    }
+
+    private fun isDone(s: Scene?): Boolean =
+        s != null && s.status == SceneStatus.DONE && s.videoPath != null && File(s.videoPath).exists()
+
+    private suspend fun runPipeline(pid: String) {
         val cfg = settings.load()
         if (cfg.spaceUrl.isBlank() || cfg.apiName.isBlank()) {
             status.value = "اضبط رابط الخدمة من الإعدادات أولاً"
             return
         }
-        var p = start
-        val dir = store.dir(p.id)
-        var carry: String? = p.startImagePath
-        val total = p.scenes.count { it.prompt.isNotBlank() }
-        var n = 0
+        val start = projects.value.firstOrNull { it.id == pid } ?: return
+        val dir = store.dir(pid)
+        val todo = start.scenes.filter { it.prompt.isNotBlank() }
+        if (todo.isEmpty()) {
+            status.value = "اكتب وصف مشهد واحد على الأقل"
+            return
+        }
+        val total = todo.size
+        val parallel = if (cfg.chainFrames) 1 else cfg.parallel.coerceIn(1, 4)
 
-        for (i in p.scenes.indices) {
-            val sc = p.scenes[i]
-            if (sc.prompt.isBlank()) continue
-            n++
-            if (sc.status == SceneStatus.DONE && sc.videoPath != null && File(sc.videoPath).exists()) {
-                if (cfg.chainFrames) carry = sc.lastFramePath ?: carry
-                continue
-            }
-            status.value = "توليد المشهد $n من $total… (قد يستغرق دقائق)"
-            p = p.mapScene(i) { it.copy(status = SceneStatus.RUNNING, error = null) }
-            commit(p)
-
-            try {
-                val imageFile = carry?.let { File(it) }?.takeIf { it.exists() }
-                val data = buildData(cfg, sc.prompt, imageFile)
-                val result = client.call(cfg, data)
-                val video = File(dir, "scene_${sc.id}.mp4")
-                client.download(cfg, result, video)
-                val frame = File(dir, "scene_${sc.id}_last.jpg")
-                val ok = FrameExtractor.lastFrame(video.absolutePath, frame)
-                p = p.mapScene(i) {
-                    it.copy(
-                        status = SceneStatus.DONE,
-                        videoPath = video.absolutePath,
-                        lastFramePath = if (ok) frame.absolutePath else null,
-                        error = null
-                    )
+        if (parallel == 1) {
+            // تتابع: كل مشهد يبدأ من آخر إطار في السابق عند تفعيل الربط
+            var carry: String? = start.startImagePath
+            var n = 0
+            for (sc in todo) {
+                n++
+                val cur = sceneOf(pid, sc.id) ?: continue
+                if (isDone(cur)) {
+                    if (cfg.chainFrames) carry = cur.lastFramePath ?: carry
+                    continue
                 }
-                commit(p)
-                if (cfg.chainFrames && ok) carry = frame.absolutePath
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                p = p.mapScene(i) { it.copy(status = SceneStatus.FAILED, error = e.message ?: "فشل غير معروف") }
-                commit(p)
-                status.value = "توقف التوليد عند المشهد $n: ${e.message}"
+                status.value = "توليد المشهد $n من $total… (قد يستغرق دقائق)"
+                val ok = generateOne(cfg, dir, pid, cur.id, cur.prompt, carry)
+                val after = sceneOf(pid, cur.id)
+                if (!ok) {
+                    status.value = "توقف التوليد عند المشهد $n: ${after?.error}"
+                    return
+                }
+                if (cfg.chainFrames) carry = after?.lastFramePath ?: carry
+            }
+        } else {
+            // توازٍ: كل المشاهد تبدأ من صورة البداية نفسها (لا ربط بين المشاهد)
+            val pending = todo.filter { !isDone(sceneOf(pid, it.id)) }
+            val gate = Semaphore(parallel)
+            val finished = AtomicInteger(total - pending.size)
+            status.value = "توليد متوازٍ ($parallel معاً): ${finished.get()} من $total"
+            val results = coroutineScope {
+                pending.map { sc ->
+                    async {
+                        gate.withPermit {
+                            val ok = generateOne(cfg, dir, pid, sc.id, sc.prompt, start.startImagePath)
+                            status.value = "توليد متوازٍ: ${finished.incrementAndGet()} من $total"
+                            ok
+                        }
+                    }
+                }.awaitAll()
+            }
+            val failed = results.count { !it }
+            if (failed > 0) {
+                status.value = "فشل $failed مشهد من ${pending.size}. اضغط «متابعة التوليد» لإعادة الفاشلة فقط."
                 return
             }
         }
 
-        val clips = p.scenes.filter { it.prompt.isNotBlank() }.mapNotNull { it.videoPath }
+        val fresh = projects.value.firstOrNull { it.id == pid } ?: return
+        val clips = fresh.scenes.filter { it.prompt.isNotBlank() }.mapNotNull { it.videoPath }
+            .filter { File(it).exists() }
         if (clips.isEmpty()) {
-            status.value = "اكتب وصف مشهد واحد على الأقل"
+            status.value = "لا توجد مقاطع للتجميع"
             return
         }
         status.value = "تجميع المقاطع في فيديو واحد…"
-        p = stitchInto(p, clips)
-        commit(p)
+        val outPath = stitchTo(pid, clips)
+        mu.withLock {
+            projects.value.firstOrNull { it.id == pid }?.let { commitBg(it.copy(outputPath = outPath)) }
+        }
         status.value = "اكتمل الفيديو ✓"
     }
 
@@ -246,32 +410,26 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun stitchInto(p: Project, clips: List<String>): Project {
-        val out = File(store.dir(p.id), "final_${System.currentTimeMillis()}.mp4")
+    /** يجمّع المقاطع في ملف جديد ويحذف الناتج القديم. يعيد مسار الملف الجديد. */
+    private suspend fun stitchTo(pid: String, clips: List<String>): String {
+        val out = File(store.dir(pid), "final_${System.currentTimeMillis()}.mp4")
         VideoStitcher.stitch(getApplication(), clips, out)
-        p.outputPath?.let { File(it).delete() }
-        return p.copy(outputPath = out.absolutePath)
+        projects.value.firstOrNull { it.id == pid }?.outputPath?.let { File(it).delete() }
+        return out.absolutePath
     }
 
     fun restitch() {
         val p = current.value ?: return
-        if (busy.value) return
         val clips = p.scenes.filter { it.prompt.isNotBlank() }.mapNotNull { it.videoPath }
             .filter { File(it).exists() }
         if (clips.isEmpty()) return
-        job = viewModelScope.launch {
-            busy.value = true
-            try {
-                status.value = "تجميع المقاطع…"
-                commit(stitchInto(p, clips))
-                status.value = "تم التجميع ✓"
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                status.value = "فشل التجميع: ${e.message}"
-            } finally {
-                busy.value = false
+        launchJob(p.id) {
+            status.value = "تجميع المقاطع…"
+            val outPath = stitchTo(p.id, clips)
+            mu.withLock {
+                projects.value.firstOrNull { it.id == p.id }?.let { commitBg(it.copy(outputPath = outPath)) }
             }
+            status.value = "تم التجميع ✓"
         }
     }
 

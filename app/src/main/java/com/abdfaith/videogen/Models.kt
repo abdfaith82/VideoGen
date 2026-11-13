@@ -31,5 +31,6 @@ data class ProviderConfig(
     val dataTemplate: String,
     val hfToken: String,
     val negativePrompt: String,
-    val chainFrames: Boolean
+    val chainFrames: Boolean,
+    val parallel: Int = 1
 )
