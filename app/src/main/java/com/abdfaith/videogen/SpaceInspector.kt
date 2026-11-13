@@ -70,6 +70,15 @@ class SpaceInspector {
             throw IOException(lastErr)
         }
 
+    /** يقرأ الـ Space ويبني قالب data للدالة المحددة. يرمي IOException برسالة واضحة عند الفشل. */
+    suspend fun templateFor(rawUrl: String, token: String, apiName: String): String {
+        val wanted = apiName.trim().trimStart('/')
+        if (wanted.isEmpty()) throw IOException("أدخل api_name أولاً")
+        val ep = inspect(rawUrl, token).firstOrNull { it.apiName == wanted }
+            ?: throw IOException("لم أجد الدالة «$wanted» في هذا الـ Space. اضغط «اختبار الاتصال» لرؤية الدوال المتاحة.")
+        return buildTemplate(ep)
+    }
+
     private fun parse(text: String): List<EndpointInfo> {
         val named = JSONObject(text).optJSONObject("named_endpoints") ?: return emptyList()
         val out = mutableListOf<EndpointInfo>()
@@ -119,9 +128,18 @@ class SpaceInspector {
             fun key(p: ParamInfo) = "${p.label} ${p.name}".lowercase()
             fun isText(p: ParamInfo) = p.component.lowercase() in setOf("textbox", "textarea")
 
-            val promptIdx = ep.params.indexOfFirst { isText(it) && "prompt" in key(it) && "negative" !in key(it) }
-                .takeIf { it >= 0 }
-                ?: ep.params.indexOfFirst { isText(it) && "negative" !in key(it) }
+            // رقم المشهد في اسم الحقل (Scene 2 …): نملأ المشهد 1 أو الحقول بلا رقم فقط
+            fun sceneNo(p: ParamInfo) =
+                Regex("""(?:scene|shot|clip|مشهد)\D{0,3}(\d+)""").find(key(p))?.groupValues?.get(1)?.toIntOrNull()
+
+            fun promptLike(p: ParamInfo) = isText(p) && "negative" !in key(p) &&
+                ("prompt" in key(p) || "scene" in key(p) || "description" in key(p) || "caption" in key(p)) &&
+                (sceneNo(p) ?: 1) == 1
+
+            val promptSet: Set<Int> = ep.params.indices.filter { promptLike(ep.params[it]) }.toSet().ifEmpty {
+                val first = ep.params.indexOfFirst { isText(it) && "negative" !in key(it) }
+                if (first >= 0) setOf(first) else emptySet()
+            }
             val negIdx = ep.params.indexOfFirst { isText(it) && "negative" in key(it) }
             val imageIdx = ep.params.indexOfFirst { it.component.equals("image", ignoreCase = true) }
             val seedIdx = ep.params.indexOfFirst {
@@ -132,7 +150,7 @@ class SpaceInspector {
             ep.params.forEachIndexed { i, p ->
                 val c = p.component.lowercase()
                 when {
-                    i == promptIdx -> arr.put("{{prompt}}")
+                    i in promptSet -> arr.put("{{prompt}}")
                     i == negIdx -> arr.put("{{negative}}")
                     i == imageIdx -> arr.put("{{image}}")
                     i == seedIdx -> arr.put("{{seed}}")

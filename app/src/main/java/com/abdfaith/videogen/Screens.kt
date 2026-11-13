@@ -508,6 +508,26 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                 label = { Text("قالب data (JSON): {{prompt}} {{image}} {{negative}} {{seed}}") },
                 textStyle = LtrStyle, minLines = 3, modifier = Modifier.fillMaxWidth()
             )
+            OutlinedButton(
+                enabled = !testing,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    testing = true
+                    testMsg = ""
+                    scope.launch {
+                        try {
+                            url = SpaceInspector.normalizeUrl(url)
+                            template = inspector.templateFor(url, token, api)
+                            saved = false
+                            testMsg = "تم توليد القالب للدالة /${api.trim().trimStart('/')}. راجعه ثم اضغط حفظ."
+                        } catch (e: Exception) {
+                            testMsg = e.message ?: "فشل توليد القالب"
+                        } finally {
+                            testing = false
+                        }
+                    }
+                }
+            ) { Text("توليد قالب data للدالة") }
             OutlinedTextField(
                 value = negative, onValueChange = { negative = it; saved = false },
                 label = { Text("الوصف السلبي") },
