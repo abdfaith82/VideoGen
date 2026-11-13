@@ -134,6 +134,9 @@ class GradioClient {
             if (dest.length() == 0L) throw IOException("الفيديو المحمّل فارغ")
         }
 
+    /** يعيد رابط أول ملف في النتيجة (أو null) دون تحميله. */
+    fun findVideoUrl(result: JSONArray, spaceUrl: String): String? = findFileUrl(result, base(spaceUrl))
+
     private val videoExt = Regex("""\.(mp4|webm|mov|mkv)(\?.*)?$""", RegexOption.IGNORE_CASE)
 
     private fun findFileUrl(node: Any?, base: String): String? {

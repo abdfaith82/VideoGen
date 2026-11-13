@@ -35,6 +35,7 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
     val settings = SettingsStore(app)
     private val client = GradioClient()
     private val ai = PromptAi()
+    private val checker = SpaceChecker()
 
     val projects = MutableStateFlow(store.loadAll())
     val current = MutableStateFlow<Project?>(null)
@@ -249,7 +250,8 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** يقسّم المشهد إلى [count] لقطات متتابعة ثم يولّدها ويجمّعها بضغطة واحدة. */
-    fun splitAndGenerate(index: Int, count: Int = 20) {
+    fun splitAndGenerate(index: Int, requested: Int = 20) {
+        val count = requested.coerceIn(2, 60)
         val p = current.value ?: return
         val sc = p.scenes.getOrNull(index) ?: return
         if (busy.value || aiIndex.value >= 0) return
@@ -279,6 +281,22 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         job?.cancel()
+    }
+
+    /** فحص سريع للإعدادات المحفوظة قبل التوليد (لا يستهلك حصة). */
+    fun checkSpace() {
+        if (busy.value) return
+        viewModelScope.launch {
+            status.value = "جارٍ فحص الخدمة…"
+            val items = try {
+                checker.staticCheck(settings.load())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                listOf(CheckItem(false, e.message ?: "فشل الفحص"))
+            }
+            status.value = items.joinToString("\n") { it.line() }
+        }
     }
 
     /** يولّد مشهداً واحداً ويحفظ نتيجته. يعيد true عند النجاح. */

@@ -22,7 +22,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -206,6 +208,8 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     val busy by vm.busy.collectAsState()
     val status by vm.status.collectAsState()
     val aiIndex by vm.aiIndex.collectAsState()
+    var countText by rememberSaveable { mutableStateOf("20") }
+    val splitN = (countText.toIntOrNull() ?: 20).coerceIn(2, 60)
     val p = project
     if (p == null) {
         LaunchedEffect(Unit) { onBack() }
@@ -296,6 +300,19 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                 }
             }
 
+            item {
+                OutlinedTextField(
+                    value = countText,
+                    onValueChange = { countText = it.filter { c -> c.isDigit() }.take(2) },
+                    enabled = !busy,
+                    label = { Text("عدد اللقطات عند التقسيم (من 2 إلى 60)") },
+                    supportingText = { Text("يُستخدم في زر «قسّم وولّد» داخل كل مشهد. الحالي: $splitN") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
             itemsIndexed(p.scenes, key = { _, s -> s.id }) { i, s ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -336,10 +353,10 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                             ) { Text(if (aiIndex == i) "جارٍ التوليد…" else "برومبت احترافي") }
                             Button(
                                 enabled = !busy && aiIndex < 0 && s.prompt.isNotBlank(),
-                                onClick = { vm.splitAndGenerate(i, 20) },
+                                onClick = { vm.splitAndGenerate(i, splitN) },
                                 contentPadding = PaddingValues(horizontal = 8.dp),
                                 modifier = Modifier.weight(1f)
-                            ) { Text("قسّم ×20 وولّد") }
+                            ) { Text("قسّم ×$splitN وولّد") }
                         }
                         val err = s.error
                         if (err != null && s.status == SceneStatus.FAILED) {
@@ -374,6 +391,9 @@ fun ProjectScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                         } else {
                             OutlinedButton(onClick = { vm.stop() }) { Text("إيقاف") }
                         }
+                    }
+                    if (!busy) {
+                        OutlinedButton(onClick = { vm.checkSpace() }) { Text("فحص الخدمة قبل التوليد") }
                     }
                     if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                     if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodyMedium)
@@ -462,6 +482,9 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
     var searching by remember { mutableStateOf(false) }
     var searchMsg by remember { mutableStateOf("") }
     var found by remember { mutableStateOf(emptyList<SpaceCandidate>()) }
+    val checker = remember { SpaceChecker() }
+    var checking by remember { mutableStateOf(false) }
+    var checkItems by remember { mutableStateOf(emptyList<CheckItem>()) }
 
     Scaffold(
         topBar = {
@@ -626,6 +649,66 @@ fun SettingsScreen(vm: ProjectViewModel, onBack: () -> Unit) {
                     }
                 }
             ) { Text("توليد قالب data للدالة") }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("فحص الـ Space", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "الفحص السريع لا يستهلك حصة ويتحقق من الرابط والدالة والقالب. " +
+                            "التجربة الحقيقية تولّد مقطعاً قصيراً وتستهلك جزءاً من حصة GPU. " +
+                            "كلاهما يستخدم القيم المكتوبة الآن دون حفظ.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            enabled = !checking,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                checking = true
+                                checkItems = emptyList()
+                                scope.launch {
+                                    try {
+                                        url = SpaceInspector.normalizeUrl(url)
+                                        checkItems = checker.staticCheck(
+                                            ProviderConfig(url, api, template, token, negative, chain, parallel)
+                                        )
+                                    } catch (e: Exception) {
+                                        checkItems = listOf(CheckItem(false, e.message ?: "فشل الفحص"))
+                                    } finally {
+                                        checking = false
+                                    }
+                                }
+                            }
+                        ) { Text(if (checking) "جارٍ الفحص…" else "فحص سريع") }
+                        Button(
+                            enabled = !checking,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                checking = true
+                                checkItems = listOf(CheckItem(null, "جارٍ التوليد التجريبي… قد يستغرق دقائق"))
+                                scope.launch {
+                                    try {
+                                        url = SpaceInspector.normalizeUrl(url)
+                                        checkItems = checker.liveTest(
+                                            ProviderConfig(url, api, template, token, negative, chain, parallel)
+                                        )
+                                    } catch (e: Exception) {
+                                        checkItems = listOf(CheckItem(false, e.message ?: "فشل الفحص"))
+                                    } finally {
+                                        checking = false
+                                    }
+                                }
+                            }
+                        ) { Text("تجربة توليد حقيقية") }
+                    }
+                    checkItems.forEach { item ->
+                        if (item.ok == false) {
+                            Text(item.line(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                        } else {
+                            Text(item.line(), style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+            }
             OutlinedTextField(
                 value = negative, onValueChange = { negative = it; saved = false },
                 label = { Text("الوصف السلبي") },
