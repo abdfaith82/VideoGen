@@ -396,7 +396,8 @@ class ProjectViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun buildData(cfg: ProviderConfig, prompt: String, image: File?): JSONArray {
         val imageJson = if (image != null) client.upload(cfg, image).toString() else "null"
-        val seed = Random.nextInt(0, Int.MAX_VALUE)
+        // حد آمن: بعض الـ Spaces ترفض seed أكبر من 1,000,000
+        val seed = Random.nextInt(0, 1_000_000)
         fun esc(s: String): String = JSONObject.quote(s).let { it.substring(1, it.length - 1) }
         val filled = cfg.dataTemplate
             .replace("{{prompt}}", esc(prompt))
